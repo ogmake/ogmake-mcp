@@ -1,0 +1,29 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "com.ogmake/mcp",
+  "description": "Generate og:image social cards and signed ogmake.com image URLs from your AI assistant.",
+  "repository": {
+    "url": "https://github.com/ogmake/ogmake-mcp",
+    "source": "github"
+  },
+  "version": "0.1.2",
+  "websiteUrl": "https://ogmake.com",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "ogmake-mcp",
+      "version": "0.1.2",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "OGMAKE_API_KEY",
+          "description": "ogmake.com API key. Optional: without it render_image uses the free watermarked endpoint.",
+          "isRequired": false,
+          "isSecret": true
+        }
+      ]
+    }
+  ]
+}
