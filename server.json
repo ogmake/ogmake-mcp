@@ -1,7 +1,7 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "com.ogmake/mcp",
-  "description": "Generate og:image social cards, check link previews, and build ogmake.com image URLs from your AI assistant.",
+  "description": "Generate og:image cards, check link previews and build ogmake.com image URLs from your AI assistant.",
   "repository": {
     "url": "https://github.com/ogmake/ogmake-mcp",
     "source": "github"
