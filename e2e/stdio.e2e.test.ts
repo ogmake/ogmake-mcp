@@ -2,26 +2,28 @@
 // as a real subprocess (`npx --yes file:<tarball>`, exactly the install
 // shape documented in README.md and proven in spike-mcp/RESULTS.md #3) and
 // talks real MCP-over-stdio JSON-RPC to it via `StdioClientTransport`,
-// against a real local `wrangler dev` instance of apps/api — no fakes, no
-// InMemoryTransport, the actual end-to-end path a real user's Claude Code/
-// Cursor install would run.
+// against a real local instance of apps/api — the api's Node server
+// (apps/api/src/node/server.ts, D130 Cloudflare -> Hetzner) on its own
+// throwaway SQLite file — no fakes, no InMemoryTransport, the actual
+// end-to-end path a real user's Claude Code/Cursor install would run.
 //
 // NOT part of `pnpm test`/turbo's `test` task or its 100% coverage gate —
 // this is a slow, process-spawning suite. Run explicitly:
 //   pnpm --filter ogmake-mcp run test:e2e
 //
 // Coordination (Opus review of cea5742, replacing the shared mkdir-lock
-// design in the now-deleted e2e/lock.ts): NO shared lock and NO fixed port.
-// Each run picks its own OS-assigned ephemeral port (process-utils.ts's
-// `getFreePort`, retried once on EADDRINUSE) and spawns `wrangler dev`
-// detached in its own process group, tracked ONLY as this process's own
-// in-memory variable — nothing written to disk for another run (or a killed
-// run's leftover state) to misinterpret. Cleanup happens in `afterAll` and in
+// design in the now-deleted e2e/lock.ts): NO shared lock, NO fixed port and
+// NO shared database. Each run picks its own OS-assigned ephemeral port
+// (process-utils.ts's `getFreePort`, retried once on EADDRINUSE), migrates
+// its own SQLite file in a fresh temp dir, and spawns the server detached in
+// its own process group, tracked ONLY as this process's own in-memory
+// variable — nothing written to disk for another run (or a killed run's
+// leftover state) to misinterpret. Cleanup happens in `afterAll` and in
 // `process.on("exit"|"SIGINT"|"SIGTERM")` handlers below, so a kill of this
 // vitest process itself (e.g. scripts/gate.sh's own process-group trap) still
-// reaches and kills our own `wrangler dev` child, whatever is running it.
-// Two copies of this suite can now run fully concurrently: distinct ports,
-// distinct in-memory state, no file each could stomp on the other's.
+// reaches and kills our server child, whatever is running it. Two copies of
+// this suite can run fully concurrently: distinct ports, distinct database
+// files, nothing each could stomp on the other's.
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { execFileSync, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
@@ -35,11 +37,21 @@ import { getFreePort, killProcessGroup, portOwnedByGroup } from "./process-utils
 
 const REPO_ROOT = fileURLToPath(new URL("../../..", import.meta.url));
 const MCP_ROOT = fileURLToPath(new URL("..", import.meta.url));
+const API_DIR = join(REPO_ROOT, "apps/api");
+
+// Fixed, obviously-fake secrets (the api test lane's TEST_VARS,
+// apps/api/src/test/cf-test.ts) shared by the server below and mintKey's
+// create-key run, so a key minted here verifies against that server.
+const SERVER_SECRETS = {
+  BETTER_AUTH_SECRET: "test-only-fake-secret-test-only-fake-secret",
+  KEY_HASH_PEPPER: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+  SIGNING_KEK: "//79/Pv6+fj39vX08/Lx8O/u7ezr6uno5+bl5OPi4eA=",
+};
 // Kept a little under beforeAll's own 180_000ms hook timeout (below) so this
 // fires and lets us kill anything we've spawned so far *before* vitest's own
 // timeout tears the hook down — guards the "late beforeAll-timeout spawn"
-// case: without this, a `wrangler dev` spawned right as (or just after) the
-// hook times out can be assigned to `wranglerProcess` AFTER `afterAll` has
+// case: without this, a server spawned right as (or just after) the
+// hook times out can be assigned to `serverProcess` AFTER `afterAll` has
 // already run (having found it `undefined`), leaking the process forever.
 const BEFORE_ALL_GUARD_MS = 170_000;
 
@@ -49,37 +61,17 @@ function toBase64Url(std: string): string {
   return std.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
-/** Reads apps/api/.dev.vars (a checked-in, gitignored, dev-only fake-secret
- * fixture — never a real credential) for KEY_HASH_PEPPER/SIGNING_KEK, the
- * two env vars tooling/src/create-key.ts needs to mint a real key against
- * the same local D1 this suite's `wrangler dev` (above) just migrated. */
-function readDevVars(): Record<string, string> {
-  const text = readFileSync(join(REPO_ROOT, "apps/api/.dev.vars"), "utf8");
-  const out: Record<string, string> = {};
-  for (const line of text.split("\n")) {
-    const match = /^([A-Z_][A-Z0-9_]*)=(.*)$/.exec(line.trim());
-    if (match) out[match[1] as string] = match[2] as string;
-  }
-  return out;
-}
-
 interface MintedKey {
   keyId: string;
   apiKey: string;
   signingSecretB64Url: string;
 }
 
-/** Mints a real, authenticated API key + signing secret on the local D1
- * (same instance this suite's `wrangler dev` serves) via
+/** Mints a real, authenticated API key + signing secret on this run's own
+ * SQLite file (the one this suite's server serves) via
  * `tooling/src/create-key.cli.ts` — the same path an operator uses for a
  * real beta invite, run locally rather than against production. */
-function mintKey(email: string): MintedKey {
-  const devVars = readDevVars();
-  // Randomized per-run label suffix isn't enough — `email` itself must be
-  // unique across runs too (see its call site in beforeAll): create-key
-  // upserts by email, and with no shared lock two concurrent runs writing
-  // the SAME fixed email to the SAME local D1 file would race each other's
-  // account/quota rows instead of each minting its own key cleanly.
+function mintKey(email: string, dbPath: string): MintedKey {
   const stdout = execFileSync(
     "pnpm",
     [
@@ -99,7 +91,7 @@ function mintKey(email: string): MintedKey {
     {
       cwd: REPO_ROOT,
       encoding: "utf8",
-      env: { ...process.env, ...devVars },
+      env: { ...process.env, ...SERVER_SECRETS, OGMAKE_DB: dbPath },
     },
   );
   const keyId = /^key id:\s+(\S+)$/m.exec(stdout)?.[1];
@@ -122,7 +114,8 @@ function run(command: string, args: string[], cwd: string): Promise<void> {
   });
 }
 
-let wranglerProcess: ChildProcessWithoutNullStreams | undefined;
+let serverProcess: ChildProcessWithoutNullStreams | undefined;
+let stateDir: string | undefined;
 let tarballPath: string;
 let tmpNpxCacheDir: string;
 let mintedKey: MintedKey;
@@ -132,73 +125,70 @@ let hookAborted = false;
 // test reads it.
 let BASE_URL: string;
 
-/** Kills `wranglerProcess` (if any) by its process group, matching
- * scripts/gate.sh's own convention for `wrangler dev` — a plain `.kill()`
- * on the pnpm/wrangler.js parent alone leaves the `workerd` child (and the
- * bound port) running after this suite exits. Shared by the beforeAll guard,
- * afterAll and the process-level handlers below so all four tear it down the
- * same way. In-memory only — no pidfile, nothing another run could read. */
-function killWrangler(): void {
-  if (wranglerProcess?.pid) {
-    killProcessGroup(wranglerProcess.pid);
+/** Kills `serverProcess` (if any) by its process group, matching
+ * scripts/gate.sh's own convention for the servers it starts. Shared by the
+ * beforeAll guard, afterAll and the process-level handlers below so all four
+ * tear it down the same way. In-memory only — no pidfile, nothing another
+ * run could read. */
+function killServer(): void {
+  if (serverProcess?.pid) {
+    killProcessGroup(serverProcess.pid);
   }
 }
 
 // This suite's own cleanup, independent of vitest's afterAll: if the vitest
 // worker process running this suite is itself killed (e.g. scripts/gate.sh's
 // own process-group SIGTERM, or an interactive Ctrl-C) before afterAll gets
-// to run, these still fire and kill our `wrangler dev` child so it never
+// to run, these still fire and kill our server child so it never
 // outlives us. Exit codes match the SIGINT/SIGTERM convention scripts/gate.sh
 // itself uses (130/143) so a caller inspecting this process's own exit code
 // sees the same story either way.
-process.on("exit", killWrangler);
+process.on("exit", killServer);
 process.on("SIGINT", () => {
-  killWrangler();
+  killServer();
   process.exit(130);
 });
 process.on("SIGTERM", () => {
-  killWrangler();
+  killServer();
   process.exit(143);
 });
 
-/** Spawns `wrangler dev` on a fresh ephemeral port, detached in its own
- * process group. Retried once on EADDRINUSE — `getFreePort()` closes its
- * probe socket before handing the port to wrangler, so something else can in
- * principle win the race and bind it first between our close() and
- * wrangler's own bind(). */
-async function spawnWranglerOnFreePort(): Promise<{
+/** Spawns the api's Node server on a fresh ephemeral port against
+ * `dbPath`, detached in its own process group. Retried once on EADDRINUSE —
+ * `getFreePort()` closes its probe socket before handing the port over, so
+ * something else can in principle win the race and bind it first between
+ * our close() and the server's own listen(). No OGMAKE_TRUSTED_PROXIES: the
+ * default (the VPS's proxy network) does not include loopback, so the
+ * server sees every caller here as its socket address, 127.0.0.1. */
+async function spawnServerOnFreePort(dbPath: string, dataDir: string): Promise<{
   port: number;
   proc: ChildProcessWithoutNullStreams;
 }> {
   for (let attempt = 1; attempt <= 2; attempt++) {
     const port = await getFreePort();
-    const proc = spawn(
-      "pnpm",
-      [
-        "--filter",
-        "@ogmake/api",
-        "exec",
-        "wrangler",
-        "dev",
-        "--port",
-        String(port),
-        "--var",
-        "EMAIL_MODE:sink",
-        "--var",
-        "RENDER_ENGINE:stub",
-        "--var",
-        "ALLOW_STUB_RENDER:1",
-      ],
+    const proc = spawn("node", ["--import", "tsx", "src/node/server.ts"], {
+      cwd: API_DIR,
+      stdio: "pipe",
       // detached: own process group, matching scripts/gate.sh's own pattern
-      // for astro preview — `wrangler dev` forks a `workerd` child, and a
-      // plain `.kill()` on the pnpm/wrangler.js parent alone leaves that
-      // whole tree (and the bound port) running after this suite exits.
-      { cwd: REPO_ROOT, stdio: "pipe", detached: true },
-    );
+      // for astro preview, so killServer() reaches everything it started.
+      detached: true,
+      env: {
+        ...process.env,
+        ...SERVER_SECRETS,
+        OGMAKE_HOST: "127.0.0.1",
+        OGMAKE_PORT: String(port),
+        OGMAKE_CRON: "0",
+        OGMAKE_DB: dbPath,
+        OGMAKE_DATA: dataDir,
+        EMAIL_MODE: "sink",
+        RENDER_ENGINE: "stub",
+        ALLOW_STUB_RENDER: "1",
+      },
+    });
 
-    // EADDRINUSE surfaces on stderr (wrangler's own error text) rather than
-    // as a `proc.on("error", ...)` — the pnpm/wrangler.js process itself
-    // spawns fine; it's wrangler's own bind that fails, inside that process.
+    // EADDRINUSE surfaces on stderr (the server's own listen error) rather
+    // than as a `proc.on("error", ...)` — the node process itself spawns
+    // fine; it's its own bind that fails, inside that process.
     // Give it a short window to fail fast before assuming the bind is fine
     // and moving on to the slower HTTP-readiness poll below.
     const addrInUse = await new Promise<boolean>((resolve) => {
@@ -224,7 +214,7 @@ async function spawnWranglerOnFreePort(): Promise<{
     if (addrInUse) {
       if (proc.pid) killProcessGroup(proc.pid);
       if (attempt === 2) {
-        throw new Error(`wrangler dev hit EADDRINUSE on a freshly-picked ephemeral port twice in a row`);
+        throw new Error(`the api server hit EADDRINUSE on a freshly-picked ephemeral port twice in a row`);
       }
       continue;
     }
@@ -236,7 +226,7 @@ async function spawnWranglerOnFreePort(): Promise<{
 beforeAll(async () => {
   // Guards the "late beforeAll-timeout spawn" case: vitest's own hook
   // timeout can fire (rejecting this beforeAll, so vitest moves straight to
-  // afterAll — which finds `wranglerProcess` still undefined) WHILE the async
+  // afterAll — which finds `serverProcess` still undefined) WHILE the async
   // work below is still mid-flight and about to assign it. This timer sets
   // `hookAborted` a little before that happens; every await point below
   // checks it and kills anything already spawned itself rather than leaving
@@ -246,43 +236,41 @@ beforeAll(async () => {
   }, BEFORE_ALL_GUARD_MS);
 
   try {
-    if (hookAborted) throw new Error("beforeAll aborted (approaching hook timeout) before wrangler dev spawn");
+    if (hookAborted) throw new Error("beforeAll aborted (approaching hook timeout) before the server spawn");
 
-    // Build the app + apply local D1 migrations, then start `wrangler dev` —
-    // same shape as apps/web/playwright.config.ts's webServer (chained so the
-    // build/migration always finish before `wrangler dev` binds its port).
-    // stub render engine: no real Browser Rendering session locally.
+    // Build the web app (the server serves it), then migrate this run's own
+    // SQLite file, then start the server — chained so the build/migration
+    // always finish before the server binds its port. Stub render engine: no
+    // Chromium attached locally.
     await run("pnpm", ["--filter", "@ogmake/web", "run", "build"], REPO_ROOT);
-    if (hookAborted) throw new Error("beforeAll aborted (approaching hook timeout) before wrangler dev spawn");
-    await run(
-      "pnpm",
-      ["--filter", "@ogmake/api", "exec", "wrangler", "d1", "migrations", "apply", "ogmake", "--local"],
-      REPO_ROOT,
-    );
-    if (hookAborted) throw new Error("beforeAll aborted (approaching hook timeout) before wrangler dev spawn");
+    if (hookAborted) throw new Error("beforeAll aborted (approaching hook timeout) before the server spawn");
+    stateDir = mkdtempSync(join(tmpdir(), "ogmake-mcp-e2e-state-"));
+    const dbPath = join(stateDir, "ogmake.sqlite");
+    await run("node", [join(API_DIR, "scripts/migrate.mjs"), dbPath], REPO_ROOT);
+    if (hookAborted) throw new Error("beforeAll aborted (approaching hook timeout) before the server spawn");
 
-    const { port, proc } = await spawnWranglerOnFreePort();
-    wranglerProcess = proc;
+    const { port, proc } = await spawnServerOnFreePort(dbPath, join(stateDir, "data"));
+    serverProcess = proc;
     BASE_URL = `http://127.0.0.1:${port}`;
     if (hookAborted) {
-      killWrangler();
-      throw new Error("beforeAll aborted (approaching hook timeout) right after wrangler dev spawn");
+      killServer();
+      throw new Error("beforeAll aborted (approaching hook timeout) right after the server spawn");
     }
 
     let ready = false;
-    wranglerProcess.stdout.on("data", () => {});
-    wranglerProcess.stderr.on("data", () => {});
+    serverProcess.stdout.on("data", () => {});
+    serverProcess.stderr.on("data", () => {});
 
     const deadline = Date.now() + 60_000;
     while (!ready && !hookAborted && Date.now() < deadline) {
       try {
         const res = await fetch(`${BASE_URL}/v1/templates`);
-        // Readiness alone isn't enough to prove it's OUR wrangler dev
-        // (something else could in principle have won the ephemeral port —
-        // see spawnWranglerOnFreePort's own EADDRINUSE retry) — verify by pid
+        // Readiness alone isn't enough to prove it's OUR server (something
+        // else could in principle have won the ephemeral port — see
+        // spawnServerOnFreePort's own EADDRINUSE retry) — verify by pid
         // match: every pid LISTENing on `port` must belong to our own spawned
         // process group.
-        if ((res.ok || res.status === 404) && wranglerProcess.pid && portOwnedByGroup(port, wranglerProcess.pid)) {
+        if ((res.ok || res.status === 404) && serverProcess.pid && portOwnedByGroup(port, serverProcess.pid)) {
           ready = true;
         }
       } catch {
@@ -291,23 +279,20 @@ beforeAll(async () => {
       if (!ready) await new Promise((r) => setTimeout(r, 500));
     }
     if (hookAborted) {
-      killWrangler();
-      throw new Error("beforeAll aborted (approaching hook timeout) while waiting for wrangler dev");
+      killServer();
+      throw new Error("beforeAll aborted (approaching hook timeout) while waiting for the server");
     }
     if (!ready) {
-      killWrangler();
-      throw new Error("wrangler dev did not become ready (and pid-verified as ours) within 60s");
+      killServer();
+      throw new Error("the api server did not become ready (and pid-verified as ours) within 60s");
     }
 
-    // Mint a real, authenticated key on this same local D1 — used by both the
-    // authenticated render_image test and the signed build_image_url test
-    // below. Email is unique per run (see mintKey's own comment): with no
-    // shared lock, two copies of this suite can now run concurrently against
-    // the same local D1 file, and a fixed email would race their
-    // account/quota upserts against each other.
-    mintedKey = mintKey(`ogmake-mcp-e2e-${randomBytes(6).toString("hex")}@example.com`);
+    // Mint a real, authenticated key on this run's own database — used by
+    // both the authenticated render_image test and the signed
+    // build_image_url test below.
+    mintedKey = mintKey(`ogmake-mcp-e2e-${randomBytes(6).toString("hex")}@example.com`, dbPath);
     if (hookAborted) {
-      killWrangler();
+      killServer();
       throw new Error("beforeAll aborted (approaching hook timeout) after minting the e2e key");
     }
 
@@ -329,7 +314,7 @@ beforeAll(async () => {
     // local `file:` specs); an isolated cache removes that variable.
     tmpNpxCacheDir = mkdtempSync(join(tmpdir(), "ogmake-mcp-npx-cache-"));
     if (hookAborted) {
-      killWrangler();
+      killServer();
       throw new Error("beforeAll aborted (approaching hook timeout) after packing the tarball");
     }
   } finally {
@@ -338,9 +323,12 @@ beforeAll(async () => {
 }, 180_000);
 
 afterAll(async () => {
-  killWrangler();
-  if (wranglerProcess?.pid) {
+  killServer();
+  if (serverProcess?.pid) {
     await new Promise((r) => setTimeout(r, 500));
+  }
+  if (stateDir) {
+    rmSync(stateDir, { recursive: true, force: true });
   }
   if (tmpNpxCacheDir) {
     rmSync(tmpNpxCacheDir, { recursive: true, force: true });
@@ -348,7 +336,7 @@ afterAll(async () => {
 }, 30_000);
 
 describe("ogmake-mcp packed tarball, real stdio, real local API", () => {
-  it("list_templates: real tool round-trip against a local wrangler dev", async () => {
+  it("list_templates: real tool round-trip against a local api server", async () => {
     const transport = new StdioClientTransport({
       command: "npx",
       args: ["--yes", `file:${tarballPath}`],
@@ -363,7 +351,9 @@ describe("ogmake-mcp packed tarball, real stdio, real local API", () => {
     try {
       const tools = await client.listTools();
       expect(tools.tools.map((t) => t.name).sort()).toEqual([
+        "auto_image_url",
         "build_image_url",
+        "check_link_preview",
         "create_batch",
         "get_batch",
         "get_usage",
@@ -446,7 +436,7 @@ describe("ogmake-mcp packed tarball, real stdio, real local API", () => {
       expect(content[0]?.type).toBe("text");
       // The inline image-bytes block is best-effort (server.ts's own
       // handler comment): `rendered.url` is the real hosted asset domain
-      // (production ogmake.com), not this suite's local wrangler dev, so
+      // (production ogmake.com), not this suite's local api server, so
       // fetching it back for a preview is expected to fail/no-op here —
       // the authenticated render call itself succeeding is what this test
       // proves.
@@ -503,7 +493,7 @@ describe("ogmake-mcp packed tarball, real stdio, real local API", () => {
   // Matrix gap 2 (2026-09-22): get_usage and og_snippet were listed in the
   // "registers exactly the five specced tools" round-trip above but never
   // actually CALLED here — this closes that gap with real calls over real
-  // stdio against the real local wrangler dev.
+  // stdio against the real local api server.
   it("get_usage: real numbers match a direct GET /v1/usage call with the same key", async () => {
     const transport = new StdioClientTransport({
       command: "npx",

@@ -47,6 +47,24 @@ function fakeClient(overrides: Partial<OgmakeClient> = {}): OgmakeClient {
       bytes: 100,
       credits: 2,
     })),
+    autoImage: vi.fn(async () => ({
+      url: "https://ogmake.com/o/img/paid/k/auto.png",
+      hash: "auto",
+      cached: false,
+      width: 1200,
+      height: 630,
+      format: "png",
+      bytes: 100,
+      templateVersion: "1",
+      credits: 1,
+      sourceUrl: "https://example.com/page",
+      refreshAfter: 1767225600,
+    })),
+    checkLinkPreview: vi.fn(async () => ({
+      url: "https://example.com/page", finalUrl: "https://example.com/page", status: 200,
+      og: {}, twitter: {}, warnings: [], findings: [], score: 100, verdict: "ready" as const,
+      counts: { errors: 0, warnings: 0, tips: 0 },
+    })),
     freeRender: vi.fn(async () => ({ bytes: new Uint8Array([1, 2, 3]), contentType: "image/png" })),
     signImageUrl: vi.fn(async () => "https://ogmake.com/i/key_1/sig123?template=hero"),
     publicImageUrl: vi.fn((keyId: string, templateId: string) => `https://ogmake.com/p/${keyId}/${templateId}`),
@@ -90,11 +108,13 @@ function envWith(overrides: Partial<OgmakeEnv> = {}): OgmakeEnv {
 }
 
 describe("buildServer — tool listing", () => {
-  it("registers exactly the nine specced tools", async () => {
+  it("registers the current tools", async () => {
     const { client, server } = await connectedClient({ env: envWith(), client: fakeClient() });
     const tools = await client.listTools();
     expect(tools.tools.map((t) => t.name).sort()).toEqual([
+      "auto_image_url",
       "build_image_url",
+      "check_link_preview",
       "create_batch",
       "get_batch",
       "get_usage",
@@ -103,6 +123,48 @@ describe("buildServer — tool listing", () => {
       "render_html",
       "render_image",
     ]);
+    await client.close();
+    await server.close();
+  });
+});
+
+describe("new link tools", () => {
+  it("checks a link preview through the SDK", async () => {
+    const sdk = fakeClient();
+    const { client, server } = await connectedClient({ env: envWith(), client: sdk });
+    const result = await client.callTool({ name: "check_link_preview", arguments: { url: "https://example.com/page" } });
+    expect(result.isError).not.toBe(true);
+    expect(sdk.checkLinkPreview).toHaveBeenCalledWith("https://example.com/page");
+    await client.close();
+    await server.close();
+  });
+
+  it("returns a safe error when the preview check fails", async () => {
+    const { client, server } = await connectedClient({
+      env: envWith(),
+      client: fakeClient({ checkLinkPreview: vi.fn(async () => { throw new OgmakeApiError("fetch_failed", 400); }) }),
+    });
+    const result = await client.callTool({ name: "check_link_preview", arguments: { url: "https://example.com/page" } });
+    expect(result.isError).toBe(true);
+    await client.close();
+    await server.close();
+  });
+
+  it("builds a public auto URL without calling the API", async () => {
+    const sdk = fakeClient();
+    const { client, server } = await connectedClient({ env: envWith({ baseUrl: "https://api.test/" }), client: sdk });
+    const result = await client.callTool({ name: "auto_image_url", arguments: { public_key: "pub_1", url: "https://example.com/page", template: "blog" } });
+    const content = result.content as Array<{ text?: string }>;
+    expect(JSON.parse(content[0]?.text ?? "")).toEqual({ url: "https://api.test/p/pub_1/auto?url=https%3A%2F%2Fexample.com%2Fpage&template=blog" });
+    expect(sdk.checkLinkPreview).not.toHaveBeenCalled();
+    await client.close();
+    await server.close();
+  });
+
+  it("returns a safe error for an invalid auto URL", async () => {
+    const { client, server } = await connectedClient({ env: envWith(), client: fakeClient() });
+    const result = await client.callTool({ name: "auto_image_url", arguments: { public_key: "pub_1", url: "not-a-url" } });
+    expect(result.isError).toBe(true);
     await client.close();
     await server.close();
   });
@@ -698,7 +760,9 @@ describe("get_usage", () => {
 
 describe("buildServer default wiring", () => {
   const EXPECTED_TOOLS = [
+    "auto_image_url",
     "build_image_url",
+    "check_link_preview",
     "create_batch",
     "get_batch",
     "get_usage",

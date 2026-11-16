@@ -27,11 +27,19 @@ export interface CreateClientOptions {
   /** Per-request timeout (ms), applied to every fetch this client makes
    * via `AbortSignal.timeout` — a hung API/origin must never block a
    * caller (e.g. ogmake-mcp's stdio tool handlers) forever. Opus review
-   * minor: previously unbounded. */
+   * minor: previously unbounded. When set, it also applies to
+   * `autoImage`; when omitted, `autoImage` uses
+   * {@link DEFAULT_AUTO_TIMEOUT_MS}. */
   timeoutMs?: number;
 }
 
 export const DEFAULT_TIMEOUT_MS = 20_000;
+/** `autoImage`'s default timeout: a first card reads the page, styles it
+ * after the site and may wait for a concurrent request for the same page
+ * (up to about two minutes server side). A client that gives up earlier
+ * may still be charged for the card it never saw; retry with the same
+ * `idempotencyKey` to get it. */
+export const DEFAULT_AUTO_TIMEOUT_MS = 180_000;
 const MAX_FREE_RENDER_BYTES = 5 * 1024 * 1024; // 5 MB
 
 /** Re-review fix: mirrors packages/mcp/src/server.ts's `readCappedBytes` —
@@ -227,6 +235,30 @@ export interface FreeRenderResult {
   contentType: string;
 }
 
+export interface CheckFinding {
+  id: string;
+  severity: "error" | "warning" | "tip";
+  message: string;
+  fix?: string;
+}
+
+/** Structured result returned by GET /v1/check. Fields produced by the
+ * service are intentionally preserved so callers can surface new additive
+ * checker details without losing the stable typed fields below. */
+export interface CheckLinkPreviewResult {
+  url: string;
+  finalUrl: string;
+  status: number;
+  og: Record<string, string>;
+  twitter: Record<string, string>;
+  warnings: Array<{ code: string; message: string }>;
+  findings: CheckFinding[];
+  score: number;
+  verdict: "ready" | "good" | "needs_work" | "broken";
+  counts: { errors: number; warnings: number; tips: number };
+  [key: string]: unknown;
+}
+
 export interface SignImageUrlOptions {
   baseUrl?: string;
   template: string;
@@ -240,8 +272,76 @@ export interface SignImageUrlOptions {
   font?: string;
 }
 
+/** Auto mode: ogmake reads the page at `url` and builds its card. */
+export interface AutoImageOptions {
+  /** Absolute `http(s)://` URL of the page the card is for. */
+  url: string;
+  /** Optional template id; the API picks one from the page when omitted. */
+  template?: string;
+  /** Sent as the `Idempotency-Key` header: a retry with the same key and
+   * payload within 24 hours replays the first response instead of rendering
+   * again (409 `idempotency_conflict` for another payload, 409
+   * `idempotency_in_progress` with `Retry-After` while the first request
+   * still runs). An error response is never kept: a retry runs again. */
+  idempotencyKey?: string;
+  /** Per-call timeout (ms). Defaults to the client's `timeoutMs`, else
+   * {@link DEFAULT_AUTO_TIMEOUT_MS}. */
+  timeoutMs?: number;
+}
+
+/** POST /v1/images `{auto: true, url}`: the stored-render shape plus the
+ * auto-mode fields. */
+export interface AutoImageResult extends RenderImageResult {
+  /** Credits this call charged: 3 when the page (or the card's own
+   * content) was billed, once per 90 days, whether the card was rendered
+   * or already cached; plus 2 for a request with a new AI hint; 0 inside the
+   * window. */
+  credits: number;
+  /** The page URL the card was built from (after the API normalised it). A
+   * response replayed for an `idempotencyKey` carries origin + path only:
+   * the page's query and fragment are never stored. */
+  sourceUrl: string;
+  /** Unix seconds when the page's 90-day billing window ends: until then
+   * the same page with the same content of its own (or none) costs no
+   * credit. Equals
+   * the request time when no window covers this card, and about a minute
+   * from now when `styleProvisional` is set. */
+  refreshAfter: number;
+  /** Present (`true`) when the site's style was still being analyzed as the
+   * card was stored, so `url` may not carry the final style. Call
+   * `autoImage` for the same page again after `refreshAfter` with a new (or
+   * no) `idempotencyKey`: inside the page's 90-day window that costs nothing
+   * and returns the final card. */
+  styleProvisional?: true;
+}
+
+export interface PublicAutoUrlOptions {
+  /** A key the owner marked public (the same id `publicImageUrl` takes). */
+  publicKey: string;
+  /** Absolute `http(s)://` URL of the page the card is for. */
+  url: string;
+  template?: string;
+  /** Defaults to {@link DEFAULT_BASE_URL}. */
+  baseUrl?: string;
+}
+
+export interface SignAutoImageUrlOptions {
+  keyId: string;
+  /** The key's signing secret: raw bytes, or the base64 string the
+   * dashboard shows (same encoding the Python SDK's `decode_secret` takes). */
+  secret: Uint8Array | string;
+  /** Absolute `http(s)://` URL of the page the card is for. */
+  url: string;
+  template?: string;
+  /** Defaults to {@link DEFAULT_BASE_URL}. */
+  baseUrl?: string;
+}
+
 export interface OgmakeClient {
   renderImage(options: RenderImageOptions): Promise<RenderImageResult>;
+  /** Auto mode: POST /v1/images `{auto: true, url, template?}`. ogmake
+   * reads the page and returns a hosted card URL. */
+  autoImage(options: AutoImageOptions): Promise<AutoImageResult>;
   /** Async single render: 202 now, the outcome POSTed to `webhookUrl`. */
   renderImageAsync(options: RenderImageAsyncOptions): Promise<RenderImageAsyncResult>;
   /** Starts an async batch of up to 500 images (POST /v1/batch, JSON). */
@@ -268,6 +368,8 @@ export interface OgmakeClient {
    * and allow-listed `templateId`; this is pure URL construction, no
    * crypto, unlike {@link signImageUrl}. */
   publicImageUrl(keyId: string, templateId: string, baseUrl?: string): string;
+  /** Checks a page's Open Graph and Twitter card metadata. */
+  checkLinkPreview(url: string): Promise<CheckLinkPreviewResult>;
 }
 
 function paramsToQuery(params: Record<string, string> | undefined): URLSearchParams {
@@ -318,6 +420,73 @@ function imageBody(opts: RenderImageOptions): Record<string, unknown> {
   return body;
 }
 
+// RFC3986 encoding, identical to packages/core/src/signing.ts and the
+// Python SDK's `urllib.parse.quote(v, safe="")`.
+function rfc3986Encode(value: string): string {
+  return encodeURIComponent(value).replace(
+    /[!'()*]/g,
+    (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase(),
+  );
+}
+
+// Same check as the Python SDK's `_check_page_url`: an absolute http(s) URL
+// with a host. The API does the real validation; this catches obvious
+// mistakes (a path, a bare host) before a URL is built or a request sent.
+const PAGE_URL_RE = /^https?:\/\/[^\s/?#]+/i;
+
+function assertPageUrl(url: string): void {
+  if (!PAGE_URL_RE.test(url)) {
+    throw new TypeError("@ogmake/sdk: url must be an absolute http(s):// page URL");
+  }
+}
+
+const BASE64_RE = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+
+function decodeSecret(secret: Uint8Array | string): Uint8Array {
+  if (typeof secret !== "string") return secret;
+  if (!BASE64_RE.test(secret)) throw new Error("invalid_signing_secret");
+  const binary = atob(secret);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+/** `{base}/p/{publicKey}/auto` — shared by {@link publicAutoUrl} and
+ * snippets.ts's `autoSnippet`. */
+export function publicAutoBase(publicKey: string, baseUrl: string = DEFAULT_BASE_URL): string {
+  return `${baseUrl.replace(/\/+$/, "")}/p/${encodeURIComponent(publicKey)}/auto`;
+}
+
+/** Public, unsigned auto-mode URL:
+ * `{base}/p/{publicKey}/auto?url={page}&template={id}`. Pure string
+ * building, safe in the browser (no secret involved). The key's owner must
+ * have marked it public. */
+export function publicAutoUrl(opts: PublicAutoUrlOptions): string {
+  assertPageUrl(opts.url);
+  let out = `${publicAutoBase(opts.publicKey, opts.baseUrl)}?url=${rfc3986Encode(opts.url)}`;
+  if (opts.template) out += `&template=${rfc3986Encode(opts.template)}`;
+  return out;
+}
+
+/** Signed auto-mode URL: `{base}/i/{keyId}/{sig}?auto=1&template=…&url=…`,
+ * the HMAC-SHA256 computed locally over the canonical query (with `auto`
+ * and `url` included), exactly as `signImageUrl` signs a template render.
+ *
+ * SERVER-SIDE ONLY. Never call this in a browser or ship the signing
+ * secret in a client bundle: anyone holding it can mint images billed to
+ * your account. Build the URL on the server and send only the URL out. */
+export async function signAutoImageUrl(opts: SignAutoImageUrlOptions): Promise<string> {
+  assertPageUrl(opts.url);
+  const query = new URLSearchParams();
+  query.set("auto", "1");
+  query.set("url", opts.url);
+  if (opts.template) query.set("template", opts.template);
+  const canonical = canonicalQuery(query);
+  const sig = await signQuery(decodeSecret(opts.secret), canonical);
+  const base = (opts.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, "");
+  return `${base}/i/${encodeURIComponent(opts.keyId)}/${sig}?${canonical}`;
+}
+
 export function createClient(options: CreateClientOptions = {}): OgmakeClient {
   const baseUrl = (options.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, "");
   const apiKey = options.apiKey;
@@ -326,6 +495,7 @@ export function createClient(options: CreateClientOptions = {}): OgmakeClient {
     throw new Error("@ogmake/sdk: no fetch available — pass { fetch } explicitly");
   }
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const autoTimeoutMs = options.timeoutMs ?? DEFAULT_AUTO_TIMEOUT_MS;
 
   function authHeaders(): Record<string, string> {
     if (!apiKey) {
@@ -340,14 +510,20 @@ export function createClient(options: CreateClientOptions = {}): OgmakeClient {
     path: string,
     contentType?: string,
     body?: unknown,
+    extraHeaders?: Record<string, string>,
+    callTimeoutMs: number = timeoutMs,
   ): Promise<T> {
-    const headers: Record<string, string> = { ...authHeaders(), "user-agent": `ogmake-sdk/${OGMAKE_SDK_VERSION}` };
+    const headers: Record<string, string> = {
+      ...authHeaders(),
+      "user-agent": `ogmake-sdk/${OGMAKE_SDK_VERSION}`,
+      ...extraHeaders,
+    };
     if (contentType) headers["content-type"] = contentType;
     const response = await doFetch(
       fetchImpl,
       `${baseUrl}${path}`,
       { method, headers, ...(body === undefined ? {} : { body: typeof body === "string" ? body : JSON.stringify(body) }) },
-      timeoutMs,
+      callTimeoutMs,
     );
     if (!response.ok) throw await toApiError(response);
     return (await response.json()) as T;
@@ -377,6 +553,20 @@ export function createClient(options: CreateClientOptions = {}): OgmakeClient {
       );
       if (!response.ok) throw await toApiError(response);
       return (await response.json()) as RenderImageResult;
+    },
+
+    async autoImage(opts: AutoImageOptions): Promise<AutoImageResult> {
+      assertPageUrl(opts.url);
+      const body: Record<string, unknown> = { auto: true, url: opts.url };
+      if (opts.template) body.template = opts.template;
+      return authed<AutoImageResult>(
+        "POST",
+        "/v1/images",
+        "application/json",
+        body,
+        opts.idempotencyKey ? { "idempotency-key": opts.idempotencyKey } : undefined,
+        opts.timeoutMs ?? autoTimeoutMs,
+      );
     },
 
     renderImageAsync(opts: RenderImageAsyncOptions): Promise<RenderImageAsyncResult> {
@@ -451,6 +641,25 @@ export function createClient(options: CreateClientOptions = {}): OgmakeClient {
       );
       if (!response.ok) throw await toApiError(response);
       return (await response.json()) as UsageResult;
+    },
+
+    async checkLinkPreview(url: string): Promise<CheckLinkPreviewResult> {
+      // /v1/check is public, but accepting a key lets the service associate
+      // requests with an account when callers have one configured.
+      const response = await doFetch(
+        fetchImpl,
+        `${baseUrl}/v1/check?url=${encodeURIComponent(url)}`,
+        {
+          method: "GET",
+          headers: {
+            ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
+            "user-agent": `ogmake-sdk/${OGMAKE_SDK_VERSION}`,
+          },
+        },
+        timeoutMs,
+      );
+      if (!response.ok) throw await toApiError(response);
+      return (await response.json()) as CheckLinkPreviewResult;
     },
 
     async freeRender(opts: FreeRenderOptions): Promise<FreeRenderResult> {

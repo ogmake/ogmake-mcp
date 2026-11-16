@@ -8,6 +8,10 @@ Local stdio [MCP](https://modelcontextprotocol.io) server for
 
 - **`list_templates`** — lists every registered og:image template id,
   version, and its params JSON Schema. No API key required.
+- **`check_link_preview`** — checks a page's Open Graph and Twitter card
+  metadata, score, and findings. No API key required.
+- **`auto_image_url`** — builds a public auto-image URL for a page using a
+  public key. No API key required.
 - **`render_html`** — renders raw HTML/CSS to a stored PNG/JPG/WebP/PDF (2 credits;
   needs `OGMAKE_API_KEY`).
 - **`render_image`** — renders an og:image.
@@ -73,10 +77,26 @@ takes the same block in `~/.cursor/mcp.json`:
 }
 ```
 
-Without `OGMAKE_API_KEY` only `list_templates`, watermarked free `render_image`,
-`build_image_url` and `og_snippet` work.
+Without `OGMAKE_API_KEY`, `list_templates`, `check_link_preview`,
+`auto_image_url`, watermarked free `render_image`, `build_image_url`, and
+`og_snippet` work.
+
+## Try it
+
+- [Check a link preview](https://ogmake.com/check?ref=mcp)
+- [Browse templates](https://ogmake.com/templates?ref=mcp)
+- [Dynamic per-record previews example](https://ogmake.com/examples/running-app-share-previews?ref=mcp)
 
 Support: support@ogmake.com · License: MIT
+
+## Development
+
+```sh
+pnpm --filter ogmake-mcp run test        # unit tests, 100% coverage
+pnpm --filter ogmake-mcp run test:e2e    # spawns the packed CLI over stdio against a local wrangler dev
+pnpm --filter ogmake-mcp run build       # tsup bundle -> dist/index.js
+pnpm --filter ogmake-mcp run pack        # build + npm pack -> pack-out/*.tgz
+```
 
 ## Development
 

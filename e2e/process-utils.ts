@@ -1,7 +1,7 @@
 // packages/mcp/e2e/process-utils.ts — process/port utilities for the stdio
 // e2e suite. Replaces e2e/lock.ts's mkdir-lock design (Opus review of
 // cea5742): that lock could have one gate's EXIT trap kill a DIFFERENT,
-// concurrent gate's `wrangler dev` and delete its lock (no pid-reuse
+// concurrent gate's api server and delete its lock (no pid-reuse
 // protection, mkdir->write races, and a trap whose own exit code could
 // silently become 0). There is no shared lock and no fixed port any more:
 // each run picks its own OS-assigned ephemeral port (see `getFreePort`
@@ -12,7 +12,7 @@ import { execFileSync } from "node:child_process";
 import { createServer } from "node:net";
 
 /** Binds an OS-assigned ephemeral port, reads it back, and releases it
- * immediately so the caller's own child process (wrangler dev) can bind it
+ * immediately so the caller's own child process (the api server) can bind it
  * itself. Inherently TOCTOU — something else could in principle grab the
  * port between our close() and the child's bind — so callers retry once on
  * EADDRINUSE rather than trust this alone. */
@@ -37,7 +37,7 @@ export function getFreePort(): Promise<number> {
 }
 
 /** Best-effort kill of a whole process group (negative pid) — used for a
- * detached `wrangler dev` child, whose pgid equals its own pid (see
+ * detached api server child, whose pgid equals its own pid (see
  * stdio.e2e.test.ts's spawn call). Never throws — the group may already be
  * gone by the time this runs. */
 export function killProcessGroup(pgid: number, signal: NodeJS.Signals = "SIGTERM"): void {
@@ -79,7 +79,7 @@ export function processGroupOf(pid: number): number | undefined {
 }
 
 /** True if `port` is currently owned by process group `ourPgid` — i.e. every
- * pid LISTENing on it belongs to our own spawned `wrangler dev` tree, not
+ * pid LISTENing on it belongs to our own spawned server tree, not
  * some other process that happened to win the same ephemeral port. This is
  * the "is this OUR instance" readiness check (pid-match) once an HTTP probe
  * says something answered on the port. */

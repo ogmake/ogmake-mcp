@@ -1,13 +1,19 @@
-// @ogmake/sdk — @ogmake/node client (P6). Real implementation:
+// @ogmake/sdk — official Node/TypeScript client. Real implementation:
 // createClient({apiKey?, baseUrl?, fetch?}) -> renderImage/renderHtml/listTemplates/
 // getUsage/freeRender/signImageUrl/publicImageUrl/createBatch/getBatch/renderImageAsync/
-// listWebhookDeliveries, verifyWebhookSignature, plus the shared
+// listWebhookDeliveries/autoImage, publicAutoUrl/signAutoImageUrl (auto mode), verifyWebhookSignature, plus the shared
 // og:image snippet generator. See decisions-2026-09-22.md item 3.
 export { OGMAKE_SDK_VERSION } from "./version";
 
 export {
   createClient,
   DEFAULT_BASE_URL,
+  publicAutoUrl,
+  signAutoImageUrl,
+  type AutoImageOptions,
+  type AutoImageResult,
+  type PublicAutoUrlOptions,
+  type SignAutoImageUrlOptions,
   type CreateClientOptions,
   type FetchLike,
   type OgmakeClient,
@@ -21,6 +27,8 @@ export {
   type UsageResult,
   type FreeRenderOptions,
   type FreeRenderResult,
+  type CheckFinding,
+  type CheckLinkPreviewResult,
   type SignImageUrlOptions,
   type RenderImageAsyncOptions,
   type RenderImageAsyncResult,
@@ -49,6 +57,9 @@ export {
 
 export {
   ogSnippet,
+  autoSnippet,
+  DEFAULT_AUTO_URL_PLACEHOLDER,
+  type AutoSnippetOptions,
   isSnippetFramework,
   SNIPPET_FRAMEWORKS,
   type SnippetFramework,

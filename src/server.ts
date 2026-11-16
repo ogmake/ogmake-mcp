@@ -1,14 +1,14 @@
-// packages/mcp/src/server.ts — ogmake-mcp's eight tools, built on
-// @ogmake/sdk (decisions-2026-09-22 item 3): list_templates, render_image,
-// render_html, build_image_url, og_snippet, get_usage, plus the
-// async batch pair create_batch / get_batch.
+// packages/mcp/src/server.ts — ogmake-mcp's tools, built on
+// @ogmake/sdk (decisions-2026-09-22 item 3): list_templates, check_link_preview,
+// auto_image_url, render_image, render_html, build_image_url, og_snippet,
+// get_usage, plus the async batch pair create_batch / get_batch.
 // Local stdio only; see README.md for the `npx --yes file:<tarball>` install shape (spike-mcp/RESULTS.md).
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import {
   createClient,
   ogSnippet,
-  OGMAKE_SDK_VERSION,
+  publicAutoUrl,
   OgmakeApiError,
   OgmakeNetworkError,
   OgmakeRedirectError,
@@ -16,6 +16,7 @@ import {
   type OgmakeClient,
   type SnippetFramework,
 } from "@ogmake/sdk";
+import packageJson from "../package.json";
 import {
   base64UrlDecode,
   MAX_BG_LENGTH,
@@ -182,10 +183,43 @@ export function buildServer(options: BuildServerOptions = {}): McpServer {
     });
   const fetchImageBytes = options.fetchImageBytes ?? defaultFetchImageBytes;
 
-  // Opus review minor: sourced from @ogmake/sdk's own version constant
-  // rather than a second hardcoded "0.1.0" literal here, so the two can't
-  // silently drift out of sync.
-  const server = new McpServer({ name: "ogmake-mcp", version: OGMAKE_SDK_VERSION });
+  const server = new McpServer({ name: "ogmake-mcp", version: packageJson.version });
+
+  server.registerTool(
+    "check_link_preview",
+    {
+      title: "Check a link preview",
+      description: "Checks a page's Open Graph and Twitter card metadata and returns its findings.",
+      inputSchema: { url: z.string().min(1).max(2048).describe("Page URL to check.") },
+    },
+    async ({ url }): Promise<ToolResult> => {
+      try {
+        return textResult(JSON.stringify(await client.checkLinkPreview(url)));
+      } catch (err) {
+        return errorResult(describeError(err));
+      }
+    },
+  );
+
+  server.registerTool(
+    "auto_image_url",
+    {
+      title: "Build an auto image URL",
+      description: "Builds a public /p/<key>/auto URL for a page. The public key must permit auto mode.",
+      inputSchema: {
+        public_key: z.string().min(1).max(256).describe("Public ogmake key id."),
+        url: z.string().min(1).max(2048).describe("Absolute http(s) page URL."),
+        template: z.string().min(1).max(MAX_TEMPLATE_ID_LENGTH).optional().describe("Optional template id."),
+      },
+    },
+    async ({ public_key, url, template }): Promise<ToolResult> => {
+      try {
+        return textResult(JSON.stringify({ url: publicAutoUrl({ publicKey: public_key, url, ...(template ? { template } : {}), ...(env.baseUrl ? { baseUrl: env.baseUrl } : {}) }) }));
+      } catch (err) {
+        return errorResult(describeError(err));
+      }
+    },
+  );
 
   server.registerTool(
     "list_templates",
